@@ -4,17 +4,49 @@ from torch.utils.data import DataLoader
 from types import SimpleNamespace
 
 from trajectory_datasets import TrajectoryDataset, trajectory_collate
-# from base_models import LinearPredictor
 from base_models_test import LinearPredictor
-from metrics_min import min_ade, min_fde
 
+# =========================
+# metrics
+# =========================
+def min_ade(pred, gt):
+    """
+    pred: (K, B, T, 2)
+    gt:   (B, T, 2)
+    Returns: (B,)
+    """
+    K, B, T, _ = pred.shape
+    gt = gt.unsqueeze(0).expand(K, -1, -1, -1)
+    ade = torch.norm(pred - gt, dim=-1).mean(dim=-1)  # (K, B)
+    return ade.min(dim=0)[0]
 
-def evaluate(model, loader, device):
+def min_fde(pred, gt):
+    """
+    pred: (K, B, T, 2)
+    gt:   (B, T, 2)
+    Returns: (B,)
+    """
+    K, B, T, _ = pred.shape
+    gt_last = gt[:, -1].unsqueeze(0).expand(K, -1, -1)
+    fde = torch.norm(pred[:, :, -1] - gt_last, dim=-1)
+    return fde.min(dim=0)[0]
+
+# =========================
+# evaluation
+# =========================
+def evaluate(model, loader, device, env):
     model.eval()
 
-    ade_sum = 0.0
-    fde_sum = 0.0
-    num_batches = 0
+    total_ade = 0.0
+    total_fde = 0.0
+    total_samples = 0
+    
+    std_dict = env.standardization['PEDESTRIAN']['position']
+    px_m, py_m = std_dict['x']['mean'], std_dict['y']['mean']
+    px_s, py_s = std_dict['x']['std'], std_dict['y']['std']
+    
+    mean_tensor = torch.tensor([px_m, py_m], device=device)
+    std_tensor = torch.tensor([px_s, py_s], device=device)
 
     with torch.no_grad():
         for x, y, vel, pos, nei_lists, batch_splits in loader:
@@ -22,23 +54,27 @@ def evaluate(model, loader, device):
             y = y.to(device)
             vel = vel.to(device)
             pos = pos.to(device)
+            B = x.size(0)
 
             pred, _, _ = model(x, vel, pos, nei_lists, batch_splits)
+            
+            pred_real = pred * std_tensor + mean_tensor
+            y_real = y * std_tensor + mean_tensor
 
-            ade = min_ade(pred, y)
-            fde = min_fde(pred, y)
+            ade = min_ade(pred_real, y_real) # (B,)
+            fde = min_fde(pred_real, y_real) # (B,)
 
-            ade_sum += ade
-            fde_sum += fde
-            num_batches += 1
+            total_ade += ade.sum().item()
+            total_fde += fde.sum().item()
+            total_samples += B
 
-    return ade_sum / num_batches, fde_sum / num_batches
+    return total_ade / total_samples, total_fde / total_samples
 
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    env = dill.load(open("processed_data_noise/hotel_test.pkl", "rb"))
+    env = dill.load(open("processed_data_noise/eth_test.pkl", "rb"))
 
     dataset = TrajectoryDataset(
         env,
@@ -66,13 +102,16 @@ def main():
     )
 
     model = LinearPredictor(args, device).to(device)
-    model.load_state_dict(torch.load("checkpoints/sdd_best_on_test.pth"))
+    model.load_state_dict(torch.load("checkpoints/eth_best_on_test.pth"))
 
-    ade, fde = evaluate(model, loader, device)
+    ade, fde = evaluate(model, loader, device, env)
 
-    print("Evaluation Results:")
-    print(f"  minADE: {ade:.4f}")
-    print(f"  minFDE: {fde:.4f}")
+    print("\n" + "="*40)
+    print(" Evaluation Results ")
+    print("="*40)
+    print(f"  minADE: {ade:.4f} meters")
+    print(f"  minFDE: {fde:.4f} meters")
+    print("="*40)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ class TrajectoryDataset(Dataset):
                 valid_nodes = []
                 for node in scene.nodes:
                     t0 = node.first_timestep
-                    t1 = t0 + node.data.position.x.shape[0]
+                    t1 = t0 + node.timesteps
                     if t >= t0 and (t + self.obs_len + self.pred_len) <= t1:
                         valid_nodes.append(node)
                 if len(valid_nodes) > 0:
@@ -38,107 +38,69 @@ class TrajectoryDataset(Dataset):
 
     def __len__(self):
         return len(self.index)
-
-    # def __getitem__(self, idx):
-    #     scene, t_start = self.index[idx]
-
-    #     xs, ys, vels, poss = [], [], [], []
-    #     agent_ids = []
-
-    #     for node in scene.nodes:
-    #         t0 = node.first_timestep
-    #         t1 = t0 + node.data.position.x.shape[0]
-    #         if t_start < t0 or (t_start + self.obs_len + self.pred_len) > t1:
-    #             continue
-
-    #         s = t_start - t0
-    #         obs = node.data.iloc[s : s + self.obs_len]
-    #         fut = node.data.iloc[s + self.obs_len : s + self.obs_len + self.pred_len]
-
-    #         x = obs[[('position', 'x'), ('position', 'y')]].values.astype(np.float32)
-    #         y = fut[[('position', 'x'), ('position', 'y')]].values.astype(np.float32)
-    #         v = obs[[('velocity', 'x'), ('velocity', 'y')]].values.astype(np.float32)
-
-    #         xs.append(x)
-    #         ys.append(y)
-    #         vels.append(v[-1])
-    #         poss.append(x[-1])
-    #         agent_ids.append(node)
-
-    #     xs = np.stack(xs)          # (N, H, 2)
-    #     ys = np.stack(ys)          # (N, T, 2)
-    #     vels = np.stack(vels)      # (N, 2)
-    #     poss = np.stack(poss)      # (N, 2)
-
-    #     nei = self._build_neighbors(poss)
-
-    #     return {
-    #         'x': xs,
-    #         'y': ys,
-    #         'vel': vels,
-    #         'pos': poss,
-    #         'nei': nei,
-    #     }
     
     def __getitem__(self, idx):
         scene, t_start = self.index[idx]
 
-        xs, ys, vels, poss = [], [], [], []
-        agent_ids = []
+        std_dict = self.env.standardization['PEDESTRIAN']
+        px_m, px_s = std_dict['position']['x']['mean'], std_dict['position']['x']['std']
+        py_m, py_s = std_dict['position']['y']['mean'], std_dict['position']['y']['std']
+        vx_m, vx_s = std_dict['velocity']['x']['mean'], std_dict['velocity']['x']['std']
+        vy_m, vy_s = std_dict['velocity']['y']['mean'], std_dict['velocity']['y']['std']
+
+        xs, ys, vels, raw_poss_list = [], [], [], []
 
         for node in scene.nodes:
             t0 = int(node.first_timestep)
-            T = int(node.data.position.x.shape[0])
+            T = int(node.timesteps)
             t1 = t0 + T
 
             if t_start < t0 or (t_start + self.obs_len + self.pred_len) > t1:
                 continue
 
             s = int(t_start - t0)
+            e_obs = s + self.obs_len
+            e_fut = e_obs + self.pred_len
 
-            # observation
-            obs_px = node.data.position.x[s : s + self.obs_len]
-            obs_py = node.data.position.y[s : s + self.obs_len]
-            obs_vx = node.data.velocity.x[s : s + self.obs_len]
-            obs_vy = node.data.velocity.y[s : s + self.obs_len]
+            pos_data = node.data[:, {'position': ['x', 'y']}]
+            vel_data = node.data[:, {'velocity': ['x', 'y']}]
 
-            # future
-            fut_px = node.data.position.x[
-                s + self.obs_len : s + self.obs_len + self.pred_len
-            ]
-            fut_py = node.data.position.y[
-                s + self.obs_len : s + self.obs_len + self.pred_len
-            ]
+            obs_pos = pos_data[s : e_obs]
+            obs_vel = vel_data[s : e_obs]
+            fut_pos = pos_data[e_obs : e_fut]
+            
+            
+            norm_obs_px = (obs_pos[:, 0] - px_m) / px_s
+            norm_obs_py = (obs_pos[:, 1] - py_m) / py_s
+            norm_obs_vx = (obs_vel[:, 0] - vx_m) / vx_s
+            norm_obs_vy = (obs_vel[:, 1] - vy_m) / vy_s
 
-            #  4D input
-            x = np.stack(
-                [obs_px, obs_py, obs_vx, obs_vy],
-                axis=-1
-            ).astype(np.float32)        # (obs_len, 4)
+            norm_fut_px = (fut_pos[:, 0] - px_m) / px_s
+            norm_fut_py = (fut_pos[:, 1] - py_m) / py_s
 
-            y = np.stack([fut_px, fut_py], axis=-1).astype(np.float32)      # (fut_len, 2)
 
-            v = np.stack([obs_vx, obs_vy], axis=-1).astype(np.float32)      # (obs_len, 2)
-
+            x = np.stack([norm_obs_px, norm_obs_py, norm_obs_vx, norm_obs_vy], axis=-1).astype(np.float32)
+            y = np.stack([norm_fut_px, norm_fut_py], axis=-1).astype(np.float32)
+            v = np.stack([norm_obs_vx, norm_obs_vy], axis=-1).astype(np.float32)
+            
             xs.append(x)
             ys.append(y)
-            vels.append(v[-1])          # (2,)
-            poss.append(x[-1, :2])      # (2,)
+            vels.append(v[-1])
+            
+            raw_poss_list.append(obs_pos[-1, :2].astype(np.float32))
 
-            agent_ids.append(node)
+        xs = np.stack(xs)                 # (N, obs_len, 4)
+        ys = np.stack(ys)                 # (N, pred_len, 2)
+        vels = np.stack(vels)             # (N, 2)
+        raw_poss_list = np.stack(raw_poss_list) # (N, 2)
 
-        xs = np.stack(xs)      # (N, obs_len, 2)
-        ys = np.stack(ys)      # (N, pred_len, 2)
-        vels = np.stack(vels)  # (N, 2)
-        poss = np.stack(poss)  # (N, 2)
-
-        nei = self._build_neighbors(poss)
+        nei = self._build_neighbors(raw_poss_list)
 
         return {
             'x': torch.from_numpy(xs),
             'y': torch.from_numpy(ys),
             'vel': torch.from_numpy(vels),
-            'pos': torch.from_numpy(poss),
+            'pos': torch.from_numpy(raw_poss_list),
             'nei': torch.from_numpy(nei),
         }
 
@@ -154,8 +116,6 @@ class TrajectoryDataset(Dataset):
         mask = (dist < self.attention_radius) & (dist > 0)
         nei[:] = mask.astype(np.int64)
         return nei
-
-
 
 def trajectory_collate(batch):
     """
